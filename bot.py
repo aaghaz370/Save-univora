@@ -350,30 +350,30 @@ Thread(target=start_worker, daemon=True).start()
 
 async def set_bot_commands():
     """Set bot menu commands"""
-    from telethon.tl.functions.bots import SetBotCommandsRequest
-    from telethon.tl.types import BotCommand
-    
-    commands = [
-        BotCommand("start", "Start the bot"),
-        BotCommand("help", "Show all commands"),
-        BotCommand("login", "Login for private channels"),
-        BotCommand("logout", "Logout from bot"),
-        BotCommand("batch", "Bulk extraction"),
-        BotCommand("settings", "Configure settings"),
-        BotCommand("myplan", "Check your plan"),
-        BotCommand("cancel", "Cancel ongoing batch"),
-        BotCommand("stats", "Bot statistics (admin)"),
-    ]
-    
     try:
+        from telethon.tl.functions.bots import SetBotCommandsRequest
+        from telethon.tl.types import BotCommand, BotCommandScopeDefault
+        
+        commands = [
+            BotCommand("start", "Start the bot"),
+            BotCommand("help", "Show all commands"),
+            BotCommand("login", "Login for private channels"),
+            BotCommand("logout", "Logout from bot"),
+            BotCommand("batch", "Bulk extraction"),
+            BotCommand("settings", "Configure settings"),
+            BotCommand("myplan", "Check your plan"),
+            BotCommand("cancel", "Cancel ongoing batch"),
+            BotCommand("stats", "Bot statistics (admin)"),
+        ]
+        
         await bot(SetBotCommandsRequest(
-            scope=None,
+            scope=BotCommandScopeDefault(),
             lang_code='en',
             commands=commands
         ))
         logger.info("✅ Bot commands menu set!")
     except Exception as e:
-        logger.error(f"Failed to set commands: {e}")
+        logger.warning(f"Commands menu skipped: {e}")
 
 # ============= BOT HANDLERS =============
 
@@ -902,7 +902,8 @@ async def thumbnail_handler(event):
 
 # ============= MAIN =============
 
-async def main():
+def main():
+    """Main entry point"""
     logger.info("=" * 50)
     logger.info("🚀 RATNA BOT 2.0 - PRODUCTION STARTED")
     logger.info("=" * 50)
@@ -915,11 +916,9 @@ async def main():
     logger.info("✅ All Features: Enabled")
     logger.info("=" * 50)
     
-    # Set bot commands menu
-    await set_bot_commands()
-    
-    # Run bot
-    await bot.run_until_disconnected()
+    # Run bot (proper event loop handling)
+    bot.loop.run_until_complete(set_bot_commands())
+    bot.run_until_disconnected()
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    main()
