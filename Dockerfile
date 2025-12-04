@@ -1,17 +1,6 @@
 FROM python:3.11-slim
-
 WORKDIR /app
-
-# Install dependencies
-COPY requirements.txt .
+COPY requirements.txt bot.py ./
 RUN pip install --no-cache-dir -r requirements.txt
-
-# Copy bot code
-COPY bot.py .
-
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s \
-  CMD python -c "import requests; requests.get('http://localhost:8080/health')"
-
-# Run bot
+EXPOSE 8080
 CMD ["python", "bot.py"]
