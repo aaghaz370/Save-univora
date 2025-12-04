@@ -386,7 +386,7 @@ async def start_handler(event):
         "**SAVE RATNA 2.0 🔥🔥🔥**\n\n"
         "Hiii! 👋 Welcome! Ready to explore some cool tricks?\n\n"
         "✳️ I can grab posts even from channels or groups where forwarding is restricted! 🔐\n\n"
-        "✳️ Need to download videos or audio from YouTube, Instagram, or other social platforms? I got you! 🎥🎵\n\n"
+        "✳️ Need to download videos or audio from YouTube, Instagram, or other social platforms! I got you! 🎥🎵\n\n"
         "✳️ Just drop the post link from any public channel. For private ones, use /login.\n\n"
         f"**Your Status:** {'💎 Premium' if is_premium else '⚪ Free'}\n\n"
         "Type /help to see all the magic! ✨\n\n"
@@ -566,17 +566,25 @@ async def logout_handler(event):
 
 @bot.on(events.NewMessage(pattern='/settings'))
 async def settings_cmd_handler(event):
+    """Settings command - direct input mode"""
     user_id = event.sender_id
     settings = db.get_user(user_id)
     
     await event.reply(
-        f"""⚙️ **Your Settings:**
+        f"""⚙️ **Customize and Configure your settings ...**
 
+**Current Settings:**
 📌 Chat ID: `{settings['chat_id'] or 'Not set'}`
 ✏️ Rename: `{settings['rename'] or 'Default'}`
 💬 Caption: `{settings.get('caption', 'Default')[:30]}...`
+🖼 Thumbnail: `{'Set' if settings.get('thumbnail') else 'Not set'}`
+🔄 Replace Rules: `{len(settings.get('replace_words', {}))}`
+🗑 Remove Words: `{len(settings.get('remove_words', []))}`
 
-**Choose an option:**""",
+**Send me the ID of that chat:**
+Example: `-1001234567890`
+
+Or use buttons below:""",
         buttons=[
             [Button.inline("📌 Set Chat ID", b"set_chatid")],
             [Button.inline("✏️ Set Rename", b"set_rename")],
@@ -587,6 +595,9 @@ async def settings_cmd_handler(event):
             [Button.inline("🔄 Reset All", b"reset_settings")]
         ]
     )
+    
+    # Set state for direct chat ID input
+    settings['temp_state'] = 'waiting_chatid_direct'
 
 @bot.on(events.NewMessage(pattern='/batch'))
 async def batch_handler(event):
@@ -754,6 +765,20 @@ async def message_handler(event):
             await event.reply(f"✅ **Chat ID set!**\n\nTarget: `{chat_id}`")
         except:
             await event.reply("❌ Invalid chat ID!")
+    
+    elif user.get('temp_state') == 'waiting_chatid_direct':
+        # Direct chat ID input from /settings command
+        try:
+            chat_id = int(text)
+            user['chat_id'] = chat_id
+            user['temp_state'] = None
+            await event.reply(
+                f"✅ **Chat ID set successfully!**\n\n"
+                f"Target: `{chat_id}`\n\n"
+                f"Now you can use /batch to start extraction!"
+            )
+        except:
+            await event.reply("❌ Invalid chat ID! Send a valid number like: `-1001234567890`")
     
     elif user.get('temp_state') == 'waiting_rename':
         user['rename'] = text
