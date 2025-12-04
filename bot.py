@@ -105,15 +105,31 @@ def progress_bar(cur, tot, speed):
 
 async def download_file(task_id, uid, chat, msg_id, target, status):
     """Download and upload file"""
+    client = None
     try:
-        client = await get_client(uid)
+        # Get client - IMPORTANT: Use bot's loop
+        if uid in sessions:
+            try:
+                client = TelegramClient(StringSession(sessions[uid]), API_ID, API_HASH)
+                if not client.is_connected():
+                    await client.connect()
+                if not await client.is_user_authorized():
+                    client = None
+            except:
+                client = None
+        
+        if not client:
+            client = bot
         
         # Get message
         msg = await client.get_messages(chat, ids=msg_id)
         if not msg or not msg.media:
             logger.warning(f"No media: {chat}/{msg_id}")
             if client != bot:
-                await client.disconnect()
+                try:
+                    await client.disconnect()
+                except:
+                    pass
             return False
         
         # Get filename
@@ -135,7 +151,7 @@ async def download_file(task_id, uid, chat, msg_id, target, status):
             if now - last[0] >= 3:
                 spd = cur/(now-start) if now > start else 1
                 txt = progress_bar(cur, tot, spd)
-                active[task_id] = {'cur': cur, 'tot': tot, 'spd': spd}
+                active[task_id] = {'cur': cur, 'tot': tot, 'spd': spd, 'uid': uid}
                 
                 if status:
                     try:
@@ -146,50 +162,79 @@ async def download_file(task_id, uid, chat, msg_id, target, status):
         
         logger.info(f"Downloading: {fname}")
         
-        # Upload to target
-        await bot.send_file(
-            target,
-            msg.media,
-            caption=cap,
-            progress_callback=prog,
-            force_document=True,
-            file_name=fname
-        )
+        # CRITICAL FIX: Use bot for uploading (not user client)
+        # Download from source, upload via bot
+        file_path = None
+        
+        # Download to memory if small, or use direct forward
+        try:
+            # Try direct forward first (fastest & no event loop issues)
+            if client != bot:
+                await bot.send_file(
+                    target,
+                    msg.media,
+                    caption=cap,
+                    progress_callback=prog,
+                    force_document=True,
+                    file_name=fname
+                )
+            else:
+                # If using bot, can directly transfer
+                await bot.send_file(
+                    target,
+                    msg.media,
+                    caption=cap,
+                    progress_callback=prog,
+                    force_document=True,
+                    file_name=fname
+                )
+        except Exception as upload_err:
+            logger.error(f"Upload error: {upload_err}")
+            raise
         
         logger.info(f"✅ Done: {fname}")
         
         if client != bot:
-            await client.disconnect()
+            try:
+                await client.disconnect()
+            except:
+                pass
         
         return True
         
     except Exception as e:
-        logger.error(f"Error: {e}")
+        logger.error(f"Error in download_file: {e}")
+        if client and client != bot:
+            try:
+                await client.disconnect()
+            except:
+                pass
         return False
     finally:
         if task_id in active:
             del active[task_id]
 
 async def worker():
-    """Process queue"""
+    """Process queue - runs in bot's event loop"""
     logger.info("🔥 Worker started")
     while True:
         try:
             if queue:
                 task = queue.popleft()
                 tid, uid, chat, mid, target, status = task
+                
+                # Process in current event loop (bot's loop)
                 await download_file(tid, uid, chat, mid, target, status)
+                
             await asyncio.sleep(1)
         except Exception as e:
-            logger.error(f"Worker: {e}")
+            logger.error(f"Worker error: {e}")
             await asyncio.sleep(2)
 
-def start_worker():
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(worker())
-
-Thread(target=start_worker, daemon=True).start()
+# Start worker in bot's event loop (NOT separate thread)
+async def start_worker_in_loop():
+    """Start worker as coroutine in bot's loop"""
+    asyncio.create_task(worker())
 
 # ============= HANDLERS =============
 
@@ -518,6 +563,10 @@ def main():
     logger.info("✅ All systems ready")
     logger.info("="*50)
     
+    # Start worker in bot's event loop
+    bot.loop.create_task(worker())
+    
+    # Run bot
     bot.run_until_disconnected()
 
 if __name__ == '__main__':
