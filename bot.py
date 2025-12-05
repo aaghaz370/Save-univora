@@ -190,47 +190,46 @@ async def download_file(task_id: str, uid: int, chat, msg_id: int, target, statu
     """
     client = None
     try:
-        logger.info(f"[{task_id}] Start - Chat: {chat}, Msg: {msg_id}, Target: {target}")
+ 
+logger.info(f"[{task_id}] Starting upload to target {target}")
 
-        # Choose client (user session or bot)
-        if uid in sessions:
-            try:
-                client = TelegramClient(StringSession(sessions[uid]), API_ID, API_HASH)
-                if not client.is_connected():
-                    await client.connect()
-                if not await client.is_user_authorized():
-                    logger.warning(f"[{task_id}] User session not authorized, fallback to bot")
-                    client = None
-                else:
-                    logger.info(f"[{task_id}] Using user session for private fetch")
-            except Exception as e:
-                logger.error(f"[{task_id}] User client error: {e}")
-                client = None
+        # 🔥 IMPORTANT FIX:
+        # Jis client se message fetch kiya (user session ya bot),
+        # Usi client se upload bhi karenge.
+        # - Private channel read + upload => user account
+        # - Public / normal cases => bot
+        upload_client = client  # client already user ya bot hoga
 
-        if not client:
-            client = bot
-            logger.info(f"[{task_id}] Using bot client")
-
-        # Fetch original message
         try:
-            msg = await client.get_messages(chat, ids=msg_id)
-        except Exception as e:
-            logger.error(f"[{task_id}] Failed to get message: {e}")
-            if client != bot:
+            uploaded_msg = await upload_client.send_file(
+                target,
+                msg.media,
+                caption=final_caption,
+                progress_callback=prog,
+                force_document=True,
+                file_name=fname
+            )
+            logger.info(f"[{task_id}] ✅ Upload successful, Msg ID: {uploaded_msg.id}")
+        except Exception as upload_err:
+            logger.error(f"[{task_id}] ❌ Upload failed: {upload_err}")
+            if status_msg:
                 try:
-                    await client.disconnect()
+                    await status_msg.edit(
+                        f"❌ **Upload failed for message `{msg_id}`**\n\n"
+                        f"Reason: `{upload_client.__class__.__name__}` error\n"
+                        f"Details console log mein dekho.\n\n"
+                        "**Powered by RATNA**"
+                    )
+                except Exception:
+                    pass
+
+            if upload_client != bot:
+                try:
+                    await upload_client.disconnect()
                 except:
                     pass
             return False
 
-        if not msg or not msg.media:
-            logger.warning(f"[{task_id}] No media found in message")
-            if client != bot:
-                try:
-                    await client.disconnect()
-                except:
-                    pass
-            return False
 
         # Determine filename
         fname = f"file_{msg_id}"
