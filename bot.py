@@ -1,6 +1,17 @@
 """
-RATNA BOT 2.0 - SIMPLE & WORKING VERSION
-Tested and production-ready
+RATNA-STYLE TELEGRAM EXTRACT BOT
+- Telethon + FastAPI + Uvicorn
+- Batch extraction with queue + progress bar
+- Private / restricted channels via user login (session)
+- Advanced settings:
+    - SETCHATID   (/setchatid)
+    - SETRENAME   (/setrename)
+    - CAPTION     (/setcaption)   -> supports {original} and {tag}
+    - REPLACEWORDS (/setreplace)  -> old => new mappings
+    - RESET       (/resetsettings)
+- Premium system:
+    - OWNER_ID + /add userID -> 1000 batch
+    - Others -> 3 batch
 """
 
 import os
@@ -29,30 +40,52 @@ logging.basicConfig(format='[%(levelname)s] %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ============= STORAGE =============
-users = {}  # {user_id: {chat_id, session, state, etc}}
-sessions = {}  # {user_id: session_string}
-premium = {OWNER_ID}  # Premium users
-queue = deque()  # Download queue
-active = {}  # Active downloads
+# users: per-user settings + state
+users = {}      # {user_id: {chat_id, state, temp, caption, rename_tag, replace_words, thumb_id}}
+sessions = {}   # {user_id: session_string}
+premium = {OWNER_ID}  # Premium users (1000 batch)
+queue = deque()       # Download queue
+active = {}           # Active downloads -> {task_id: {cur, tot, spd, uid}}
 
-def get_user(uid):
+def get_user(uid: int):
+    """
+    Get or init user config.
+    New keys:
+        caption: custom caption template (supports {original}, {tag})
+        rename_tag: e.g. "@YourChannel"
+        replace_words: dict {old: new} for caption replacement
+        thumb_id: reserved for future custom thumbnail usage
+    """
     if uid not in users:
-        users[uid] = {'chat_id': None, 'state': None, 'temp': {}}
+        users[uid] = {
+            'chat_id': None,
+            'state': None,
+            'temp': {},
+            'caption': None,
+            'rename_tag': None,
+            'replace_words': {},
+            'thumb_id': None,
+        }
     return users[uid]
 
 # ============= TELEGRAM =============
 bot = TelegramClient('bot', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
 
-async def get_client(uid):
-    """Get user client or bot"""
+async def get_client(uid: int):
+    """
+    Get user client (logged-in session) or fall back to bot.
+    This is exactly how RATNA-style private extraction works:
+    - If user session is authorized and member of private channel -> can fetch posts.
+    - Else -> use bot (only for public/accessible chats).
+    """
     if uid in sessions:
         try:
             c = TelegramClient(StringSession(sessions[uid]), API_ID, API_HASH)
             await c.connect()
             if await c.is_user_authorized():
                 return c
-        except:
-            pass
+        except Exception as e:
+            logger.error(f"get_client: Error using user session for {uid}: {e}")
     return bot
 
 # ============= FASTAPI =============
@@ -60,17 +93,27 @@ app = FastAPI()
 
 @app.get("/health")
 def health():
+    """
+    Health endpoint for Render + UptimeRobot.
+    """
     return {"status": "ok", "queue": len(queue), "active": len(active)}
 
 def run_api():
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv('PORT', 8080)), log_level="error")
 
+# Start FastAPI in background thread
 Thread(target=run_api, daemon=True).start()
 
 # ============= HELPERS =============
 
-def parse_link(link):
-    """Parse Telegram link"""
+def parse_link(link: str):
+    """
+    Parse Telegram post link.
+    Supports:
+        https://t.me/c/<internal_id>/<msg_id>
+        https://t.me/<username>/<msg_id>
+    Returns: (chat, msg_id) or None
+    """
     m = re.search(r't\.me/c/(\d+)/(\d+)', link)
     if m:
         return (int(f"-100{m.group(1)}"), int(m.group(2)))
@@ -79,18 +122,20 @@ def parse_link(link):
         return (m.group(1), int(m.group(2)))
     return None
 
-def progress_bar(cur, tot, speed):
-    """Format progress"""
-    pct = (cur/tot*100) if tot > 0 else 0
-    bars = int(pct/10)
-    bar = "♦"*bars + "◇"*(10-bars)
-    mb_cur = cur/1e6
-    mb_tot = tot/1e6
-    kb_s = speed/1024
-    eta = (tot-cur)/speed if speed > 0 else 0
-    eta_m = int(eta/60)
-    eta_s = int(eta%60)
-    
+def progress_bar(cur: int, tot: int, speed: float):
+    """
+    Make nice ASCII progress box like RATNA.
+    """
+    pct = (cur / tot * 100) if tot > 0 else 0
+    bars = int(pct / 10)
+    bar = "♦" * bars + "◇" * (10 - bars)
+    mb_cur = cur / 1e6
+    mb_tot = tot / 1e6
+    kb_s = speed / 1024
+    eta = (tot - cur) / speed if speed > 0 else 0
+    eta_m = int(eta / 60)
+    eta_s = int(eta % 60)
+
     return f"""╭─────────────────────╮
 │   Downloading...
 ├─────────────────────
@@ -101,34 +146,72 @@ def progress_bar(cur, tot, speed):
 │ ETA: {eta_m}m {eta_s}s
 ╰─────────────────────╯"""
 
+def apply_caption_logic(uid: int, original_caption: str) -> str:
+    """
+    Apply user settings on caption:
+    1) replace_words -> text replace
+    2) caption template with {original} and {tag}
+    3) if no template but rename_tag set -> append tag
+    """
+    u = get_user(uid)
+    cap = original_caption or ""
+
+    # 1) Replace words
+    replace_map = u.get('replace_words') or {}
+    for old, new in replace_map.items():
+        if old:
+            cap = cap.replace(old, new)
+
+    tag = u.get('rename_tag') or ""
+
+    # 2) Caption template
+    template = u.get('caption')
+    if template:
+        final_cap = template.replace('{original}', cap).replace('{tag}', tag)
+        return final_cap
+
+    # 3) If no template but tag present -> append
+    if tag:
+        if cap:
+            return f"{cap}\n\n{tag}"
+        else:
+            return tag
+
+    # Default: just processed caption
+    return cap
+
 # ============= WORKER =============
 
-async def download_file(task_id, uid, chat, msg_id, target, status):
-    """Download and upload file with detailed logging"""
+async def download_file(task_id: str, uid: int, chat, msg_id: int, target, status_msg):
+    """
+    Download & upload a single message's media.
+    Uses user session when possible, else bot.
+    Does NOT store big files on disk, just streams via Telethon.
+    """
     client = None
     try:
-        logger.info(f"[{task_id}] Starting - Chat: {chat}, Msg: {msg_id}, Target: {target}")
-        
-        # Get client
+        logger.info(f"[{task_id}] Start - Chat: {chat}, Msg: {msg_id}, Target: {target}")
+
+        # Choose client (user session or bot)
         if uid in sessions:
             try:
                 client = TelegramClient(StringSession(sessions[uid]), API_ID, API_HASH)
                 if not client.is_connected():
                     await client.connect()
                 if not await client.is_user_authorized():
-                    logger.warning(f"[{task_id}] User session not authorized, using bot")
+                    logger.warning(f"[{task_id}] User session not authorized, fallback to bot")
                     client = None
                 else:
-                    logger.info(f"[{task_id}] Using user session")
+                    logger.info(f"[{task_id}] Using user session for private fetch")
             except Exception as e:
                 logger.error(f"[{task_id}] User client error: {e}")
                 client = None
-        
+
         if not client:
             client = bot
             logger.info(f"[{task_id}] Using bot client")
-        
-        # Get message
+
+        # Fetch original message
         try:
             msg = await client.get_messages(chat, ids=msg_id)
         except Exception as e:
@@ -139,64 +222,66 @@ async def download_file(task_id, uid, chat, msg_id, target, status):
                 except:
                     pass
             return False
-        
+
         if not msg or not msg.media:
-            logger.warning(f"[{task_id}] No media in message")
+            logger.warning(f"[{task_id}] No media found in message")
             if client != bot:
                 try:
                     await client.disconnect()
                 except:
                     pass
             return False
-        
-        # Get filename
+
+        # Determine filename
         fname = f"file_{msg_id}"
         if msg.document:
             for attr in msg.document.attributes:
                 if isinstance(attr, DocumentAttributeFilename):
                     fname = attr.file_name
-        
-        logger.info(f"[{task_id}] File: {fname}, Size: {msg.file.size if msg.file else 0} bytes")
-        
-        # Caption
-        cap = msg.text or msg.caption or ""
-        
+
+        size_bytes = msg.file.size if msg.file else 0
+        logger.info(f"[{task_id}] File: {fname}, Size: {size_bytes} bytes")
+
+        # Prepare caption
+        original_cap = msg.text or msg.caption or ""
+        final_caption = apply_caption_logic(uid, original_cap)
+
         # Progress tracking
         start = time.time()
         last = [0]
-        
+
         async def prog(cur, tot):
             now = time.time()
             if now - last[0] >= 3:
-                spd = cur/(now-start) if now > start else 1
+                spd = cur / (now - start) if now > start else 1
                 active[task_id] = {'cur': cur, 'tot': tot, 'spd': spd, 'uid': uid}
-                
-                pct = (cur/tot*100) if tot > 0 else 0
+
+                pct = (cur / tot * 100) if tot > 0 else 0
                 logger.info(f"[{task_id}] Progress: {pct:.1f}% ({cur}/{tot} bytes) @ {spd/1024:.1f} KB/s")
-                
-                if status:
+
+                if status_msg:
                     try:
                         txt = progress_bar(cur, tot, spd)
-                        await status.edit(f"**Downloading: {fname[:30]}...**\n\n{txt}\n\n**Powered by RATNA**")
+                        await status_msg.edit(
+                            f"**Downloading: {fname[:40]}**\n\n{txt}\n\n**Powered by RATNA**"
+                        )
                     except Exception as e:
                         logger.error(f"[{task_id}] Status update error: {e}")
                 last[0] = now
-        
-        logger.info(f"[{task_id}] Starting upload to {target}")
-        
-        # Upload to target
+
+        logger.info(f"[{task_id}] Starting upload to target {target}")
+
+        # Upload using bot (not user client) so everything goes from your bot to target chat
         try:
             uploaded_msg = await bot.send_file(
                 target,
                 msg.media,
-                caption=cap,
+                caption=final_caption,
                 progress_callback=prog,
                 force_document=True,
                 file_name=fname
             )
-            
-            logger.info(f"[{task_id}] ✅ Upload successful! Message ID: {uploaded_msg.id}")
-            
+            logger.info(f"[{task_id}] ✅ Upload successful, Msg ID: {uploaded_msg.id}")
         except Exception as upload_err:
             logger.error(f"[{task_id}] ❌ Upload failed: {upload_err}")
             if client != bot:
@@ -205,17 +290,17 @@ async def download_file(task_id, uid, chat, msg_id, target, status):
                 except:
                     pass
             return False
-        
+
         if client != bot:
             try:
                 await client.disconnect()
             except:
                 pass
-        
+
         return True
-        
+
     except Exception as e:
-        logger.error(f"[{task_id}] ❌ Error: {e}", exc_info=True)
+        logger.error(f"[{task_id}] ❌ Fatal error: {e}", exc_info=True)
         if client and client != bot:
             try:
                 await client.disconnect()
@@ -226,27 +311,23 @@ async def download_file(task_id, uid, chat, msg_id, target, status):
         if task_id in active:
             del active[task_id]
 
+
 async def worker():
-    """Process queue - runs in bot's event loop"""
+    """
+    Download queue worker – runs inside bot's event loop.
+    Processes tasks one-by-one, others stay queued.
+    """
     logger.info("🔥 Worker started")
     while True:
         try:
             if queue:
                 task = queue.popleft()
                 tid, uid, chat, mid, target, status = task
-                
-                # Process in current event loop (bot's loop)
                 await download_file(tid, uid, chat, mid, target, status)
-                
             await asyncio.sleep(1)
         except Exception as e:
             logger.error(f"Worker error: {e}")
             await asyncio.sleep(2)
-
-# Start worker in bot's event loop (NOT separate thread)
-async def start_worker_in_loop():
-    """Start worker as coroutine in bot's loop"""
-    asyncio.create_task(worker())
 
 # ============= HANDLERS =============
 
@@ -254,20 +335,25 @@ async def start_worker_in_loop():
 async def cmd_start(e):
     uid = e.sender_id
     is_prem = uid in premium
-    
+
     await e.reply(
-        "**RATNA BOT 2.0 🔥**\n\n"
-        "Welcome! I can extract files from:\n"
-        "✅ Private channels (login required)\n"
+        "**RATNA STYLE BOT 🔥**\n\n"
+        "I can extract files from:\n"
+        "✅ Private channels (after /login & if your account is member)\n"
         "✅ Public channels\n"
-        "✅ Restricted channels\n\n"
-        f"Status: {'💎 Premium' if is_prem else '⚪ Free'}\n\n"
-        "**Commands:**\n"
+        "✅ Restricted channels (where your account has access)\n\n"
+        f"Status: {'💎 Premium (1000 batch)' if is_prem else '⚪ Free (3 batch)'}\n\n"
+        "**Main Commands:**\n"
         "/login - Login for private channels\n"
-        "/settings - Set target chat ID\n"
+        "/settings - Show settings help\n"
+        "/setchatid - Set target chat ID\n"
+        "/setcaption - Set custom caption template\n"
+        "/setrename - Set rename tag (e.g. @YourChannel)\n"
+        "/setreplace - Configure word replacements\n"
+        "/resetsettings - Reset all settings\n"
         "/batch - Start extraction\n"
-        "/cancel - Stop batch\n"
-        "/myplan - Check plan\n\n"
+        "/cancel - Cancel your batch\n"
+        "/myplan - Check your plan\n\n"
         "**Powered by RATNA**",
         buttons=[
             [Button.inline("⚙️ Settings", b"settings")],
@@ -280,26 +366,38 @@ async def cb_settings(e):
     await e.answer()
     uid = e.sender_id
     u = get_user(uid)
-    
+
+    # Build short preview
+    cap_preview = u['caption'] or "Default (original caption)"
+    tag_preview = u['rename_tag'] or "Not set"
+    rep_map = u['replace_words'] or {}
+    rep_preview = ", ".join([f"'{k}'→'{v}'" for k, v in rep_map.items()]) or "None"
+
     await e.edit(
-        f"⚙️ **Settings**\n\n"
-        f"Chat ID: `{u['chat_id'] or 'Not set'}`\n\n"
-        "Send me chat ID to set target:",
+        "⚙️ **Settings Overview**\n\n"
+        f"Chat ID: `{u['chat_id'] or 'Not set'}`\n"
+        f"Caption template: `{cap_preview}`\n"
+        f"Rename tag: `{tag_preview}`\n"
+        f"Replace words: {rep_preview}\n\n"
+        "**Commands:**\n"
+        "`/setchatid` - set target chat\n"
+        "`/setcaption` - set caption template\n"
+        "`/setrename` - set rename tag\n"
+        "`/setreplace` - set word replacements\n"
+        "`/resetsettings` - reset everything",
         buttons=[[Button.inline("🔙 Back", b"back")]]
     )
-    u['state'] = 'wait_chatid'
 
 @bot.on(events.CallbackQuery(pattern=b"plan"))
 async def cb_plan(e):
     await e.answer()
     uid = e.sender_id
     is_prem = uid in premium
-    
+
     if is_prem:
-        txt = "💎 **Premium Active**\n\nBatch: 1000 files\nSpeed: Fast\nAll features unlocked"
+        txt = "💎 **Premium Active**\n\nBatch limit: 1000 files\nSpeed: Fast\nAll features unlocked."
     else:
-        txt = "⚪ **Free Plan**\n\nBatch: 3 files\nSpeed: Standard"
-    
+        txt = "⚪ **Free Plan**\n\nBatch limit: 3 files\nSpeed: Standard."
     await e.edit(txt, buttons=[[Button.inline("🔙 Back", b"back")]])
 
 @bot.on(events.CallbackQuery(pattern=b"back"))
@@ -307,10 +405,10 @@ async def cb_back(e):
     await e.answer()
     uid = e.sender_id
     is_prem = uid in premium
-    
+
     await e.edit(
-        f"**RATNA BOT 2.0 🔥**\n\n"
-        f"Status: {'💎 Premium' if is_prem else '⚪ Free'}\n\n"
+        f"**RATNA STYLE BOT 🔥**\n\n"
+        f"Status: {'💎 Premium (1000 batch)' if is_prem else '⚪ Free (3 batch)'}\n\n"
         "Choose option:",
         buttons=[
             [Button.inline("⚙️ Settings", b"settings")],
@@ -318,27 +416,100 @@ async def cb_back(e):
         ]
     )
 
+# ---------- SETTINGS COMMANDS ----------
+
 @bot.on(events.NewMessage(pattern='/settings'))
 async def cmd_settings(e):
     uid = e.sender_id
     u = get_user(uid)
-    
+    cap_preview = u['caption'] or "Default (original caption)"
+    tag_preview = u['rename_tag'] or "Not set"
+    rep_map = u['replace_words'] or {}
+    rep_preview = ", ".join([f"'{k}'→'{v}'" for k, v in rep_map.items()]) or "None"
+
     await e.reply(
-        f"⚙️ **Settings**\n\n"
-        f"Current Chat ID: `{u['chat_id'] or 'Not set'}`\n\n"
-        "**Send me the target chat ID:**\n"
+        "⚙️ **Settings**\n\n"
+        f"Current Chat ID: `{u['chat_id'] or 'Not set'}`\n"
+        f"Caption template: `{cap_preview}`\n"
+        f"Rename tag: `{tag_preview}`\n"
+        f"Replace words: {rep_preview}\n\n"
+        "**Sub-commands:**\n"
+        "`/setchatid` - Set target chat ID\n"
+        "`/setcaption` - Set caption template (supports {original} and {tag})\n"
+        "`/setrename` - Set rename tag (e.g., @YourChannel)\n"
+        "`/setreplace` - Configure word replacements\n"
+        "`/resetsettings` - Reset all settings"
+    )
+
+@bot.on(events.NewMessage(pattern='/setchatid'))
+async def cmd_setchatid(e):
+    uid = e.sender_id
+    u = get_user(uid)
+    u['state'] = 'wait_chatid'
+    await e.reply(
+        "📌 **Set Chat ID**\n\n"
+        "Send the target chat ID:\n"
         "Example: `-1001234567890`"
     )
-    u['state'] = 'wait_chatid'
+
+@bot.on(events.NewMessage(pattern='/setcaption'))
+async def cmd_setcaption(e):
+    uid = e.sender_id
+    u = get_user(uid)
+    u['state'] = 'wait_caption'
+    await e.reply(
+        "📝 **Set Caption Template**\n\n"
+        "You can use:\n"
+        "`{original}` = original caption\n"
+        "`{tag}` = your rename tag\n\n"
+        "Example:\n"
+        "`{original}\\n\\nUploaded by {tag}`"
+    )
+
+@bot.on(events.NewMessage(pattern='/setrename'))
+async def cmd_setrename(e):
+    uid = e.sender_id
+    u = get_user(uid)
+    u['state'] = 'wait_rename'
+    await e.reply(
+        "🏷 **Set Rename Tag**\n\n"
+        "Example:\n"
+        "`@YourChannel` or `Uploaded by @YourChannel`"
+    )
+
+@bot.on(events.NewMessage(pattern='/setreplace'))
+async def cmd_setreplace(e):
+    uid = e.sender_id
+    u = get_user(uid)
+    u['state'] = 'wait_replace'
+    await e.reply(
+        "🔤 **Set Replace Words**\n\n"
+        "Format (use `=>` and `||`):\n"
+        "`old1 => new1 || old2 => new2`\n\n"
+        "Example:\n"
+        "`t.me/oldchannel => t.me/newchannel || OldName => NewName`"
+    )
+
+@bot.on(events.NewMessage(pattern='/resetsettings'))
+async def cmd_resetsettings(e):
+    uid = e.sender_id
+    u = get_user(uid)
+    u['caption'] = None
+    u['rename_tag'] = None
+    u['replace_words'] = {}
+    u['thumb_id'] = None
+    u['state'] = None
+    await e.reply("♻️ **All settings reset to default!**")
+
+# ---------- LOGIN / BATCH / PLAN / ADMIN ----------
 
 @bot.on(events.NewMessage(pattern='/login'))
 async def cmd_login(e):
     u = get_user(e.sender_id)
     u['state'] = 'wait_phone'
-    
     await e.reply(
         "🔐 **Login**\n\n"
-        "Step 1: Send phone number\n"
+        "Step 1: Send phone number (with country code)\n"
         "Example: `+919876543210`"
     )
 
@@ -349,47 +520,47 @@ async def cmd_logout(e):
         del sessions[uid]
         await e.reply("✅ Logged out!")
     else:
-        await e.reply("⚠️ Not logged in")
+        await e.reply("⚠️ Not logged in.")
 
 @bot.on(events.NewMessage(pattern='/batch'))
 async def cmd_batch(e):
     uid = e.sender_id
     u = get_user(uid)
-    
+
     if not u['chat_id']:
-        await e.reply("⚠️ First set chat ID: /settings")
+        await e.reply("⚠️ First set target chat ID: `/setchatid` or `/settings`")
         return
-    
+
     u['state'] = 'wait_link'
-    await e.reply("**Send post link:**\n\nExample: `https://t.me/channel/123`")
+    await e.reply("🔗 **Send post link:**\n\nExample: `https://t.me/channel/123`")
 
 @bot.on(events.NewMessage(pattern='/cancel'))
 async def cmd_cancel(e):
     uid = e.sender_id
     removed = 0
-    
-    # Remove from queue
+
+    # Remove tasks of this user from queue
     new_q = deque()
     for task in queue:
         if task[1] != uid:
             new_q.append(task)
         else:
             removed += 1
-    
+
     queue.clear()
     queue.extend(new_q)
-    
-    await e.reply(f"✅ Cancelled! Removed {removed} tasks")
+
+    await e.reply(f"✅ Cancelled! Removed {removed} queued tasks.")
 
 @bot.on(events.NewMessage(pattern='/myplan'))
 async def cmd_myplan(e):
     uid = e.sender_id
     is_prem = uid in premium
-    
+
     if is_prem:
-        await e.reply("💎 **Premium Active**\n\nBatch: 1000\nSpeed: Fast\nAll features")
+        await e.reply("💎 **Premium Active**\n\nBatch: 1000 files\nSpeed: Fast\nAll features unlocked.")
     else:
-        await e.reply("⚪ **Free Plan**\n\nBatch: 3\nSpeed: Standard")
+        await e.reply("⚪ **Free Plan**\n\nBatch: 3 files\nSpeed: Standard.")
 
 @bot.on(events.NewMessage(pattern=r'^/add (\d+)$'))
 async def cmd_add(e):
@@ -397,7 +568,7 @@ async def cmd_add(e):
         return
     uid = int(e.pattern_match.group(1))
     premium.add(uid)
-    await e.reply(f"✅ Added {uid} to premium")
+    await e.reply(f"✅ Added `{uid}` to premium (1000 batch).")
 
 @bot.on(events.NewMessage(pattern=r'^/rem (\d+)$'))
 async def cmd_rem(e):
@@ -406,15 +577,15 @@ async def cmd_rem(e):
     uid = int(e.pattern_match.group(1))
     if uid in premium and uid != OWNER_ID:
         premium.discard(uid)
-        await e.reply(f"✅ Removed {uid}")
+        await e.reply(f"✅ Removed `{uid}` from premium.")
 
 @bot.on(events.NewMessage(pattern='/stats'))
 async def cmd_stats(e):
     if e.sender_id != OWNER_ID:
         return
-    
+
     await e.reply(
-        f"📊 **Stats**\n\n"
+        "📊 **Stats**\n\n"
         f"Users: {len(users)}\n"
         f"Premium: {len(premium)}\n"
         f"Queue: {len(queue)}\n"
@@ -422,195 +593,235 @@ async def cmd_stats(e):
         f"Sessions: {len(sessions)}"
     )
 
-# ============= MESSAGE HANDLER =============
+# ============= MESSAGE HANDLER (STATE MACHINE) =============
 
 @bot.on(events.NewMessage)
 async def msg_handler(e):
     uid = e.sender_id
-    txt = e.text.strip()
+    txt = e.text.strip() if e.text else ""
     u = get_user(uid)
     state = u.get('state')
-    
+
     if not state:
         return
-    
-    # LOGIN FLOW
+
+    # ---------- LOGIN FLOW ----------
     if state == 'wait_phone':
         if not txt.startswith('+'):
             await e.reply("❌ Send with country code: `+919876543210`")
             return
-        
         try:
             c = TelegramClient(StringSession(), API_ID, API_HASH)
             await c.connect()
             result = await c.send_code_request(txt)
-            
+
             u['temp'] = {'phone': txt, 'hash': result.phone_code_hash, 'client': c}
             u['state'] = 'wait_otp'
-            await e.reply("📱 **OTP sent!**\n\nStep 2: Send OTP\nExample: `1 2 3 4 5`")
+            await e.reply("📱 **OTP sent!**\n\nStep 2: Send OTP like: `1 2 3 4 5`")
         except Exception as ex:
             await e.reply(f"❌ Error: {ex}")
             u['state'] = None
-    
+
     elif state == 'wait_otp':
         try:
             otp = txt.replace(' ', '')
             tmp = u['temp']
             c = tmp['client']
-            
+
             try:
                 await c.sign_in(phone=tmp['phone'], code=otp, phone_code_hash=tmp['hash'])
             except SessionPasswordNeededError:
                 u['state'] = 'wait_2fa'
                 await e.reply("🔐 **2FA Required**\n\nStep 3: Send 2FA password")
                 return
-            
+
             sessions[uid] = c.session.save()
             await c.disconnect()
-            
+
             u['state'] = None
             u['temp'] = {}
             await e.reply("✅ **Login successful!**")
-            
         except PhoneCodeInvalidError:
-            await e.reply("❌ Invalid OTP! Try /login again")
+            await e.reply("❌ Invalid OTP! Try `/login` again.")
             u['state'] = None
         except Exception as ex:
             await e.reply(f"❌ Error: {ex}")
             u['state'] = None
-    
+
     elif state == 'wait_2fa':
         try:
             tmp = u['temp']
             c = tmp['client']
             await c.sign_in(password=txt)
-            
+
             sessions[uid] = c.session.save()
             await c.disconnect()
-            
+
             u['state'] = None
             u['temp'] = {}
             await e.reply("✅ **Login successful with 2FA!**")
         except Exception as ex:
             await e.reply(f"❌ Invalid password: {ex}")
             u['state'] = None
-    
-    # SETTINGS FLOW
+
+    # ---------- SETTINGS FLOW ----------
     elif state == 'wait_chatid':
         try:
             cid = int(txt)
             u['chat_id'] = cid
             u['state'] = None
-            await e.reply(f"✅ **Chat ID set!**\n\nTarget: `{cid}`\n\nNow use /batch")
-        except:
+            await e.reply(
+                f"✅ **Chat ID set!**\n\n"
+                f"Target: `{cid}`\n\n"
+                "Now use `/batch` to start extraction."
+            )
+        except Exception:
             await e.reply("❌ Invalid! Send number like: `-1001234567890`")
-    
-    # BATCH FLOW
+
+    elif state == 'wait_caption':
+        # Save caption template
+        u['caption'] = txt
+        u['state'] = None
+        await e.reply(
+            "✅ **Caption template saved!**\n\n"
+            "Remember you can use `{original}` and `{tag}` placeholders."
+        )
+
+    elif state == 'wait_rename':
+        u['rename_tag'] = txt
+        u['state'] = None
+        await e.reply(f"✅ **Rename tag set to:** `{txt}`")
+
+    elif state == 'wait_replace':
+        # Parse "old => new || old2 => new2"
+        mapping = {}
+        parts = [p.strip() for p in txt.split("||") if p.strip()]
+        for part in parts:
+            if "=>" in part:
+                old, new = part.split("=>", 1)
+                old = old.strip()
+                new = new.strip()
+                if old:
+                    mapping[old] = new
+
+        u['replace_words'] = mapping
+        u['state'] = None
+
+        preview = ", ".join([f"'{k}'→'{v}'" for k, v in mapping.items()]) or "None"
+        await e.reply(f"✅ **Replace words updated:** {preview}")
+
+    # ---------- BATCH FLOW ----------
     elif state == 'wait_link':
         parsed = parse_link(txt)
         if not parsed:
-            await e.reply("❌ Invalid link!")
+            await e.reply("❌ Invalid link!\nSend Telegram post link like: `https://t.me/c/...` or `https://t.me/channel/123`")
             return
-        
+
         u['batch_chat'], u['batch_start'] = parsed
         u['state'] = 'wait_count'
-        
+
         max_lim = 1000 if uid in premium else 3
-        await e.reply(f"**How many files?**\n\nMax: {max_lim}")
-    
+        await e.reply(f"**How many files?**\n\nMax: `{max_lim}`")
+
     elif state == 'wait_count':
         try:
             count = int(txt)
             max_lim = 1000 if uid in premium else 3
-            
+
             if count > max_lim:
-                await e.reply(f"❌ Max {max_lim}! Upgrade: /myplan")
+                await e.reply(f"❌ Max `{max_lim}`! Check your plan: `/myplan`")
                 return
-            
+
             u['state'] = None
             target = u['chat_id']
             chat = u['batch_chat']
             start_id = u['batch_start']
-            
-            status = await e.reply(f"**Batch started ⚡**\n\nProcessing: 0/{count}\n\n**Powered by RATNA**")
-            
-            # Add to queue
+
+            status = await e.reply(
+                f"**Batch started ⚡**\n\n"
+                f"Processing: 0/{count}\n\n"
+                f"**Powered by RATNA**"
+            )
+
+            # Add tasks to queue
             for i in range(count):
                 tid = str(uuid.uuid4())
                 mid = start_id + i
                 queue.append((tid, uid, chat, mid, target, status))
-            
+
             logger.info(f"Added {count} tasks for user {uid}")
-            
-            # Monitor progress properly
+
+            # Monitor progress
             completed = 0
             last_completed = -1
-            
+
             while completed < count:
                 await asyncio.sleep(5)
-                
-                # Count tasks still in queue
+
                 in_queue = sum(1 for t in queue if t[1] == uid)
-                
-                # Count active downloads for this user
-                in_active = sum(1 for tid, data in active.items() if data.get('uid') == uid)
-                
-                # Calculate completed
+                in_active = sum(1 for t_id, data in active.items() if data.get('uid') == uid)
+
                 completed = count - in_queue - in_active
-                
-                # Get progress text if something is downloading
+
+                # Progress of current active download
                 progress_text = ""
-                for tid, data in active.items():
+                for t_id, data in active.items():
                     if data.get('uid') == uid:
                         cur = data.get('cur', 0)
                         tot = data.get('tot', 1)
                         spd = data.get('spd', 0)
                         progress_text = f"\n\n{progress_bar(cur, tot, spd)}"
                         break
-                
-                # Update status only if changed
+
                 if completed != last_completed or progress_text:
                     try:
-                        msg_text = f"**Batch started ⚡**\n\nCompleted: {completed}/{count}\nQueue: {in_queue}\nActive: {in_active}{progress_text}\n\n**Powered by RATNA**"
+                        msg_text = (
+                            f"**Batch started ⚡**\n\n"
+                            f"Completed: {completed}/{count}\n"
+                            f"Queue: {in_queue}\n"
+                            f"Active: {in_active}"
+                            f"{progress_text}\n\n"
+                            f"**Powered by RATNA**"
+                        )
                         await status.edit(msg_text)
                         last_completed = completed
-                    except Exception as e:
-                        logger.error(f"Status update failed: {e}")
-                
-                # Safety: if no more in queue/active but not all completed, break
+                    except Exception as ex:
+                        logger.error(f"Status update failed: {ex}")
+
+                # Safety: if nothing left in queue/active but completed < count, break
                 if in_queue == 0 and in_active == 0:
                     break
-            
-            # Final message
+
+            # Final summary
             try:
                 await status.edit(
-                    f"✅ **Batch completed!**\n\n"
-                    f"Total: {count}\n"
-                    f"Successful: {completed}\n"
-                    f"Failed: {count - completed}\n\n"
+                    "✅ **Batch completed!**\n\n"
+                    f"Total requested: {count}\n"
+                    f"Approx successful: {completed}\n"
+                    f"Approx failed: {count - completed}\n\n"
                     f"Check your channel: `{target}`\n\n"
-                    f"**Powered by RATNA**"
+                    "**Powered by RATNA**"
                 )
-            except:
+            except Exception:
                 pass
-            
+
         except ValueError:
-            await e.reply("❌ Invalid number!")
+            await e.reply("❌ Invalid number! Send a valid integer.")
 
 # ============= MAIN =============
 
 def main():
-    logger.info("="*50)
-    logger.info("🚀 RATNA BOT 2.0 STARTED")
-    logger.info("="*50)
+    logger.info("=" * 50)
+    logger.info("🚀 RATNA STYLE BOT STARTED")
+    logger.info("=" * 50)
     logger.info(f"Owner: {OWNER_ID}")
-    logger.info(f"Premium: {len(premium)}")
+    logger.info(f"Premium users: {len(premium)}")
     logger.info("✅ All systems ready")
-    logger.info("="*50)
-    
-    # Start worker in bot's event loop
+    logger.info("=" * 50)
+
+    # Start worker
     bot.loop.create_task(worker())
-    
+
     # Run bot
     bot.run_until_disconnected()
 
