@@ -104,27 +104,44 @@ def progress_bar(cur, tot, speed):
 # ============= WORKER =============
 
 async def download_file(task_id, uid, chat, msg_id, target, status):
-    """Download and upload file"""
+    """Download and upload file with detailed logging"""
     client = None
     try:
-        # Get client - IMPORTANT: Use bot's loop
+        logger.info(f"[{task_id}] Starting - Chat: {chat}, Msg: {msg_id}, Target: {target}")
+        
+        # Get client
         if uid in sessions:
             try:
                 client = TelegramClient(StringSession(sessions[uid]), API_ID, API_HASH)
                 if not client.is_connected():
                     await client.connect()
                 if not await client.is_user_authorized():
+                    logger.warning(f"[{task_id}] User session not authorized, using bot")
                     client = None
-            except:
+                else:
+                    logger.info(f"[{task_id}] Using user session")
+            except Exception as e:
+                logger.error(f"[{task_id}] User client error: {e}")
                 client = None
         
         if not client:
             client = bot
+            logger.info(f"[{task_id}] Using bot client")
         
         # Get message
-        msg = await client.get_messages(chat, ids=msg_id)
+        try:
+            msg = await client.get_messages(chat, ids=msg_id)
+        except Exception as e:
+            logger.error(f"[{task_id}] Failed to get message: {e}")
+            if client != bot:
+                try:
+                    await client.disconnect()
+                except:
+                    pass
+            return False
+        
         if not msg or not msg.media:
-            logger.warning(f"No media: {chat}/{msg_id}")
+            logger.warning(f"[{task_id}] No media in message")
             if client != bot:
                 try:
                     await client.disconnect()
@@ -139,6 +156,8 @@ async def download_file(task_id, uid, chat, msg_id, target, status):
                 if isinstance(attr, DocumentAttributeFilename):
                     fname = attr.file_name
         
+        logger.info(f"[{task_id}] File: {fname}, Size: {msg.file.size if msg.file else 0} bytes")
+        
         # Caption
         cap = msg.text or msg.caption or ""
         
@@ -150,49 +169,42 @@ async def download_file(task_id, uid, chat, msg_id, target, status):
             now = time.time()
             if now - last[0] >= 3:
                 spd = cur/(now-start) if now > start else 1
-                txt = progress_bar(cur, tot, spd)
                 active[task_id] = {'cur': cur, 'tot': tot, 'spd': spd, 'uid': uid}
+                
+                pct = (cur/tot*100) if tot > 0 else 0
+                logger.info(f"[{task_id}] Progress: {pct:.1f}% ({cur}/{tot} bytes) @ {spd/1024:.1f} KB/s")
                 
                 if status:
                     try:
-                        await status.edit(f"**Processing...**\n\n{txt}\n\n**Powered by RATNA**")
-                    except:
-                        pass
+                        txt = progress_bar(cur, tot, spd)
+                        await status.edit(f"**Downloading: {fname[:30]}...**\n\n{txt}\n\n**Powered by RATNA**")
+                    except Exception as e:
+                        logger.error(f"[{task_id}] Status update error: {e}")
                 last[0] = now
         
-        logger.info(f"Downloading: {fname}")
+        logger.info(f"[{task_id}] Starting upload to {target}")
         
-        # CRITICAL FIX: Use bot for uploading (not user client)
-        # Download from source, upload via bot
-        file_path = None
-        
-        # Download to memory if small, or use direct forward
+        # Upload to target
         try:
-            # Try direct forward first (fastest & no event loop issues)
-            if client != bot:
-                await bot.send_file(
-                    target,
-                    msg.media,
-                    caption=cap,
-                    progress_callback=prog,
-                    force_document=True,
-                    file_name=fname
-                )
-            else:
-                # If using bot, can directly transfer
-                await bot.send_file(
-                    target,
-                    msg.media,
-                    caption=cap,
-                    progress_callback=prog,
-                    force_document=True,
-                    file_name=fname
-                )
+            uploaded_msg = await bot.send_file(
+                target,
+                msg.media,
+                caption=cap,
+                progress_callback=prog,
+                force_document=True,
+                file_name=fname
+            )
+            
+            logger.info(f"[{task_id}] ✅ Upload successful! Message ID: {uploaded_msg.id}")
+            
         except Exception as upload_err:
-            logger.error(f"Upload error: {upload_err}")
-            raise
-        
-        logger.info(f"✅ Done: {fname}")
+            logger.error(f"[{task_id}] ❌ Upload failed: {upload_err}")
+            if client != bot:
+                try:
+                    await client.disconnect()
+                except:
+                    pass
+            return False
         
         if client != bot:
             try:
@@ -203,7 +215,7 @@ async def download_file(task_id, uid, chat, msg_id, target, status):
         return True
         
     except Exception as e:
-        logger.error(f"Error in download_file: {e}")
+        logger.error(f"[{task_id}] ❌ Error: {e}", exc_info=True)
         if client and client != bot:
             try:
                 await client.disconnect()
@@ -530,22 +542,55 @@ async def msg_handler(e):
             
             logger.info(f"Added {count} tasks for user {uid}")
             
-            # Monitor
-            done = 0
-            while done < count:
+            # Monitor progress properly
+            completed = 0
+            last_completed = -1
+            
+            while completed < count:
                 await asyncio.sleep(5)
                 
-                in_q = sum(1 for t in queue if t[1] == uid)
-                in_act = sum(1 for t in active.values() if t.get('uid') == uid)
-                done = count - in_q - in_act
+                # Count tasks still in queue
+                in_queue = sum(1 for t in queue if t[1] == uid)
                 
-                try:
-                    await status.edit(f"**Batch started ⚡**\n\nProcessing: {done}/{count}\n\n**Powered by RATNA**")
-                except:
-                    pass
+                # Count active downloads for this user
+                in_active = sum(1 for tid, data in active.items() if data.get('uid') == uid)
+                
+                # Calculate completed
+                completed = count - in_queue - in_active
+                
+                # Get progress text if something is downloading
+                progress_text = ""
+                for tid, data in active.items():
+                    if data.get('uid') == uid:
+                        cur = data.get('cur', 0)
+                        tot = data.get('tot', 1)
+                        spd = data.get('spd', 0)
+                        progress_text = f"\n\n{progress_bar(cur, tot, spd)}"
+                        break
+                
+                # Update status only if changed
+                if completed != last_completed or progress_text:
+                    try:
+                        msg_text = f"**Batch started ⚡**\n\nCompleted: {completed}/{count}\nQueue: {in_queue}\nActive: {in_active}{progress_text}\n\n**Powered by RATNA**"
+                        await status.edit(msg_text)
+                        last_completed = completed
+                    except Exception as e:
+                        logger.error(f"Status update failed: {e}")
+                
+                # Safety: if no more in queue/active but not all completed, break
+                if in_queue == 0 and in_active == 0:
+                    break
             
+            # Final message
             try:
-                await status.edit(f"✅ **Batch done!**\n\nTotal: {count}\n\n**Powered by RATNA**")
+                await status.edit(
+                    f"✅ **Batch completed!**\n\n"
+                    f"Total: {count}\n"
+                    f"Successful: {completed}\n"
+                    f"Failed: {count - completed}\n\n"
+                    f"Check your channel: `{target}`\n\n"
+                    f"**Powered by RATNA**"
+                )
             except:
                 pass
             
