@@ -181,7 +181,6 @@ def apply_caption_logic(uid: int, original_caption: str) -> str:
     return cap
 
 # ============= WORKER =============
-
 async def download_file(task_id: str, uid: int, chat, msg_id: int, target, status_msg):
     """
     Download & upload a single message's media.
@@ -190,46 +189,47 @@ async def download_file(task_id: str, uid: int, chat, msg_id: int, target, statu
     """
     client = None
     try:
- 
-logger.info(f"[{task_id}] Starting upload to target {target}")
+        logger.info(f"[{task_id}] Start - Chat: {chat}, Msg: {msg_id}, Target: {target}")
 
-        # 🔥 IMPORTANT FIX:
-        # Jis client se message fetch kiya (user session ya bot),
-        # Usi client se upload bhi karenge.
-        # - Private channel read + upload => user account
-        # - Public / normal cases => bot
-        upload_client = client  # client already user ya bot hoga
+        # Choose client (user session or bot)
+        if uid in sessions:
+            try:
+                client = TelegramClient(StringSession(sessions[uid]), API_ID, API_HASH)
+                if not client.is_connected():
+                    await client.connect()
+                if not await client.is_user_authorized():
+                    logger.warning(f"[{task_id}] User session not authorized, fallback to bot")
+                    client = None
+                else:
+                    logger.info(f"[{task_id}] Using user session for private fetch")
+            except Exception as e:
+                logger.error(f"[{task_id}] User client error: {e}")
+                client = None
 
+        if not client:
+            client = bot
+            logger.info(f"[{task_id}] Using bot client")
+
+        # Fetch original message
         try:
-            uploaded_msg = await upload_client.send_file(
-                target,
-                msg.media,
-                caption=final_caption,
-                progress_callback=prog,
-                force_document=True,
-                file_name=fname
-            )
-            logger.info(f"[{task_id}] ✅ Upload successful, Msg ID: {uploaded_msg.id}")
-        except Exception as upload_err:
-            logger.error(f"[{task_id}] ❌ Upload failed: {upload_err}")
-            if status_msg:
+            msg = await client.get_messages(chat, ids=msg_id)
+        except Exception as e:
+            logger.error(f"[{task_id}] Failed to get message: {e}")
+            if client != bot:
                 try:
-                    await status_msg.edit(
-                        f"❌ **Upload failed for message `{msg_id}`**\n\n"
-                        f"Reason: `{upload_client.__class__.__name__}` error\n"
-                        f"Details console log mein dekho.\n\n"
-                        "**Powered by RATNA**"
-                    )
-                except Exception:
-                    pass
-
-            if upload_client != bot:
-                try:
-                    await upload_client.disconnect()
+                    await client.disconnect()
                 except:
                     pass
             return False
 
+        if not msg or not msg.media:
+            logger.warning(f"[{task_id}] No media found in message")
+            if client != bot:
+                try:
+                    await client.disconnect()
+                except:
+                    pass
+            return False
 
         # Determine filename
         fname = f"file_{msg_id}"
@@ -241,7 +241,7 @@ logger.info(f"[{task_id}] Starting upload to target {target}")
         size_bytes = msg.file.size if msg.file else 0
         logger.info(f"[{task_id}] File: {fname}, Size: {size_bytes} bytes")
 
-        # Prepare caption
+        # Prepare caption (with your caption/rename/replace logic)
         original_cap = msg.text or msg.caption or ""
         final_caption = apply_caption_logic(uid, original_cap)
 
@@ -270,9 +270,13 @@ logger.info(f"[{task_id}] Starting upload to target {target}")
 
         logger.info(f"[{task_id}] Starting upload to target {target}")
 
-        # Upload using bot (not user client) so everything goes from your bot to target chat
+        # 🔥 IMPORTANT FIX:
+        # Jis client se message fetch kiya (user session ya bot),
+        # usi client se upload bhi karenge.
+        upload_client = client  # yahi user ya bot hoga
+
         try:
-            uploaded_msg = await bot.send_file(
+            uploaded_msg = await upload_client.send_file(
                 target,
                 msg.media,
                 caption=final_caption,
@@ -283,9 +287,19 @@ logger.info(f"[{task_id}] Starting upload to target {target}")
             logger.info(f"[{task_id}] ✅ Upload successful, Msg ID: {uploaded_msg.id}")
         except Exception as upload_err:
             logger.error(f"[{task_id}] ❌ Upload failed: {upload_err}")
-            if client != bot:
+            if status_msg:
                 try:
-                    await client.disconnect()
+                    await status_msg.edit(
+                        f"❌ **Upload failed for message `{msg_id}`**\n\n"
+                        f"`{upload_err}`\n\n"
+                        "**Powered by RATNA**"
+                    )
+                except Exception:
+                    pass
+
+            if upload_client != bot:
+                try:
+                    await upload_client.disconnect()
                 except:
                     pass
             return False
@@ -309,6 +323,13 @@ logger.info(f"[{task_id}] Starting upload to target {target}")
     finally:
         if task_id in active:
             del active[task_id]
+
+
+
+        
+
+    
+        
 
 
 async def worker():
